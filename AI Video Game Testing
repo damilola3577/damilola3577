@@ -1,0 +1,157 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Reflection;
+using UnityEngine;
+using UnityEngine.AI;
+using UnityEngine.Events;
+
+[Serializable]
+public class AIPlayerController : MonoBehaviour
+{
+    public NavMeshAgent navMeshAgent;
+    public UnityEngine.Object targetObject;
+    public string functionName;
+    public string className;
+
+    public Type baseClassType;
+    public Interactable interactableTarget;
+
+    public List<Destination> destinations = new();
+    public UnityEvent<MonoBehaviour> interactionFunction;
+
+    public Transform playerTransform;
+    public Transform endGoalPoint;
+
+    public float interactionCheckRange = 5f;
+    public bool isHiding;
+    public bool inMovement;
+
+    private void Start()
+    {
+        baseClassType = Type.GetType(className);
+        Debug.Log($"Resolved base class type: {baseClassType}");
+
+        Type componentType = targetObject.GetComponent<PlayerController>().GetType();
+        Component componentInstance = targetObject.GetComponent(baseClassType);
+
+        MethodInfo method = componentType.GetMethod(functionName);
+        if (method != null)
+        {
+            Debug.Log($"Invoking method: {method.Name}");
+            method.Invoke(componentInstance, new object[] { interactableTarget });
+        }
+        else
+        {
+            Debug.LogError("Method not found on component!");
+        }
+    }
+
+    private void Update()
+    {
+        AIMovement();
+    }
+
+    private void AIMovement()
+    {
+        if (!inMovement)
+        {
+            StartCoroutine(DestinationSetter(endGoalPoint));
+        }
+    }
+
+    private IEnumerator DestinationSetter(Transform destination)
+    {
+        inMovement = true;
+        navMeshAgent.SetDestination(destination.position);
+
+        Vector3 lastPosition = playerTransform.position;
+        float timeSinceLastMovement = 0f;
+
+        const float stuckThreshold = 0.1f;
+        const float stuckCheckInterval = 0.5f;
+        const float stuckTimeout = 2.0f;
+
+        while (Vector3.Distance(playerTransform.position, destination.position) > 1f)
+        {
+            yield return new WaitForSeconds(stuckCheckInterval);
+
+            float distanceMoved = Vector3.Distance(playerTransform.position, lastPosition);
+
+            if (distanceMoved < stuckThreshold)
+            {
+                timeSinceLastMovement += stuckCheckInterval;
+
+                if (timeSinceLastMovement >= stuckTimeout)
+                {
+                    Debug.Log("Player is stuck!");
+                    navMeshAgent.ResetPath();
+                    yield return StartCoroutine(SimulateInteraction());
+                    break;
+                }
+            }
+            else
+            {
+                timeSinceLastMovement = 0f;
+            }
+
+            lastPosition = playerTransform.position;
+        }
+
+        inMovement = false;
+    }
+
+    private IEnumerator SimulateInteraction()
+    {
+        const float maxRange = 20f;
+        const float rangeStep = 1f;
+
+        bool interactableFound = false;
+        float initialRange = interactionCheckRange;
+
+        while (interactionCheckRange <= maxRange)
+        {
+            foreach (var destination in destinations)
+            {
+                if (!destination.passed && Vector3.Distance(playerTransform.position, destination.destinationPoint.transform.position) <= interactionCheckRange)
+                {
+                    yield return StartCoroutine(DestinationSetter(destination.destinationPoint.transform));
+
+                    interactionFunction.Invoke(destination.destinationPoint);
+                    destination.passed = true;
+                    interactableFound = true;
+                    break;
+                }
+            }
+
+            if (interactableFound)
+            {
+                interactionCheckRange = initialRange; // Reset range
+                break;
+            }
+
+            interactionCheckRange += rangeStep;
+        }
+
+        if (!interactableFound)
+        {
+            Debug.LogWarning("No interactable found within range.");
+        }
+    }
+
+    private void OnDrawGizmos()
+    {
+        if (playerTransform != null)
+        {
+            Gizmos.color = Color.yellow;
+            Gizmos.DrawWireSphere(playerTransform.position, interactionCheckRange);
+        }
+    }
+}
+
+[Serializable]
+public class Destination
+{
+    public MonoBehaviour destinationPoint;
+    public bool passed;
+}
