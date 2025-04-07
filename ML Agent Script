@@ -1,0 +1,240 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Unity.MLAgents;
+using Unity.MLAgents.Actuators;
+using Unity.MLAgents.Sensors;
+using UnityEngine;
+
+public class MLAgentController : Agent
+{
+    #region Agent Attributes
+    [Header("Agent Setup")]
+    public Transform endPoint;
+    public Transform[] waypoints;
+    public Transform spawnPoint;
+    public Rigidbody rigidBody;
+
+    [Header("Agent Movement")]
+    public float moveSpeed = 3f;
+    public float rotationSpeed = 360f;
+    public float visionRange = 10f;
+
+    [Header("Environment Layers")]
+    public LayerMask obstacleMask;
+    public LayerMask coverMask;
+    #endregion
+
+    #region Interaction Setup
+    [Header("Interaction")]
+    public string interactableTag;
+    public string interactableClassName;
+    public string interactionFunctionName;
+    public string pathFileName;
+
+    private Type interactableClass;
+    #endregion
+
+    #region Runtime Variables
+    private List<Vector3> pathPositions = new();
+    private int currentWaypointIndex = 0;
+    private float previousDistanceToEnd;
+    private Vector3 previousPosition;
+    #endregion
+
+    #region Unity Methods
+    private void Start()
+    {
+        if (!string.IsNullOrEmpty(interactableClassName))
+        {
+            interactableClass = Type.GetType(interactableClassName);
+        }
+
+        previousPosition = transform.position;
+    }
+
+    private void OnCollisionEnter(Collision collision)
+    {
+        if (((1 << collision.gameObject.layer) & obstacleMask) != 0)
+        {
+            AddReward(-0.5f);
+            Debug.LogWarning("Hit an obstacle! Penalty applied.");
+        }
+    }
+
+    private void OnDrawGizmos()
+    {
+        Gizmos.color = Color.yellow;
+        Gizmos.DrawWireSphere(transform.position, visionRange);
+
+        if (waypoints != null)
+        {
+            Gizmos.color = Color.blue;
+            foreach (var wp in waypoints)
+            {
+                if (wp != null)
+                    Gizmos.DrawWireSphere(wp.position, 1f);
+            }
+        }
+    }
+    #endregion
+
+    #region ML-Agent Lifecycle
+    public override void OnEpisodeBegin()
+    {
+        transform.position = spawnPoint.position + Vector3.up * 0.1f;
+        transform.rotation = Quaternion.identity;
+
+        rigidBody.velocity = Vector3.zero;
+        rigidBody.angularVelocity = Vector3.zero;
+
+        previousDistanceToEnd = Vector3.Distance(transform.localPosition, endPoint.localPosition);
+        previousPosition = transform.position;
+        currentWaypointIndex = 0;
+
+        Debug.Log($"Episode started. Resetting state.");
+        pathPositions.Clear();
+    }
+
+    public override void CollectObservations(VectorSensor sensor)
+    {
+        sensor.AddObservation(transform.localPosition);
+
+        Transform target = GetCurrentTarget();
+        sensor.AddObservation(target.localPosition);
+
+        float distanceToTarget = Vector3.Distance(transform.localPosition, target.localPosition);
+        sensor.AddObservation(distanceToTarget);
+    }
+
+    public override void OnActionReceived(ActionBuffers actions)
+    {
+        float moveForward = actions.ContinuousActions[0];
+        float moveSideways = actions.ContinuousActions[1];
+        float interactAction = actions.ContinuousActions[2];
+
+        // Movement
+        Vector3 forwardMovement = transform.forward * moveForward * moveSpeed * Time.deltaTime;
+        Vector3 sidewaysMovement = transform.right * moveSideways * moveSpeed * Time.deltaTime;
+        rigidBody.MovePosition(rigidBody.position + forwardMovement + sidewaysMovement);
+
+        // Reward Calculations
+        float distanceToTarget = Vector3.Distance(transform.localPosition, GetCurrentTarget().localPosition);
+        float distanceTraveled = Vector3.Distance(previousPosition, transform.position);
+        pathPositions.Add(transform.position);
+        AddReward(distanceTraveled * 0.001f);
+
+        if (distanceToTarget < previousDistanceToEnd)
+            AddReward(0.01f);
+        else
+            AddReward(-0.005f);
+
+        previousPosition = transform.position;
+        previousDistanceToEnd = distanceToTarget;
+
+        // Check for target reach
+        if (distanceToTarget < 1.5f)
+        {
+            if (currentWaypointIndex < waypoints.Length)
+            {
+                AddReward(0.5f);
+                Debug.Log($"Waypoint {currentWaypointIndex + 1} reached.");
+                SavePathData();
+                currentWaypointIndex++;
+            }
+            else
+            {
+                AddReward(1.0f);
+                Debug.Log("Destination reached!");
+                SavePathData();
+                EndEpisode();
+            }
+        }
+
+        // Interaction Trigger
+        if (interactAction > 0.5f)
+        {
+            FindInteractables();
+        }
+    }
+
+    public override void Heuristic(in ActionBuffers actionsOut)
+    {
+        var continuousActions = actionsOut.ContinuousActions;
+        continuousActions[0] = Input.GetAxis("Vertical");
+        continuousActions[1] = Input.GetAxis("Horizontal");
+        continuousActions[2] = Input.GetKey(KeyCode.Space) ? 1f : 0f;
+    }
+    #endregion
+
+    #region Utility Methods
+
+    private Transform GetCurrentTarget()
+    {
+        return currentWaypointIndex < waypoints.Length ? waypoints[currentWaypointIndex] : endPoint;
+    }
+
+    private void FindInteractables()
+    {
+        if (string.IsNullOrEmpty(interactableTag) || interactableClass == null)
+        {
+            Debug.LogError("Interactable tag or class not defined.");
+            return;
+        }
+
+        GameObject[] interactables = GameObject.FindGameObjectsWithTag(interactableTag);
+        foreach (var obj in interactables)
+        {
+            float distance = Vector3.Distance(transform.position, obj.transform.position);
+            if (distance < 3f)
+            {
+                Debug.Log($"Interactable found: {obj.name}");
+                if (obj.TryGetComponent(interactableClass, out Component comp))
+                {
+                    InteractWith(comp as MonoBehaviour);
+                }
+            }
+        }
+    }
+
+    private void InteractWith(MonoBehaviour interactable)
+    {
+        if (interactable == null || string.IsNullOrEmpty(interactionFunctionName))
+        {
+            Debug.LogError("Invalid interaction target or function name.");
+            return;
+        }
+
+        var method = interactable.GetType().GetMethod(interactionFunctionName);
+        if (method != null)
+        {
+            method.Invoke(interactable, null);
+        }
+        else
+        {
+            Debug.LogError($"Method '{interactionFunctionName}' not found on {interactable.name}");
+        }
+    }
+
+    private void SavePathData()
+    {
+        string filePath = Path.Combine(Application.dataPath, pathFileName.Replace("Assets/", "")).Replace("\\", "/");
+
+        try
+        {
+            using StreamWriter writer = new StreamWriter(filePath, true);
+            foreach (var pos in pathPositions)
+            {
+                string line = $"{Academy.Instance.EpisodeCount},{pos.x:F2},{pos.y:F2},{pos.z:F2}";
+                writer.WriteLine(line);
+            }
+            Debug.Log($"Path data saved to {filePath}");
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"Failed to write path data: {e.Message}");
+        }
+    }
+
+    #endregion
+}
